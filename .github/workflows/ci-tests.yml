@@ -1,0 +1,726 @@
+name: CI Tests
+
+on:
+  push:
+    branches:
+      - master
+      - develop
+      - 'pr-*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tests_to_run:
+        description: 'Scope of tests to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - unit-only
+          - skip
+      skip_integration:
+        description: 'Skip GitHub/Azure integration tests'
+        required: false
+        default: false
+        type: boolean
+      skip_sca_integration:
+        description: 'Skip SCA integration tests'
+        required: false
+        default: false
+        type: boolean
+      skip_jira_integration:
+        description: 'Skip Jira integration tests'
+        required: false
+        default: false
+        type: boolean
+      skip_pr_comments:
+        description: 'Skip PR comments integration tests'
+        required: false
+        default: false
+        type: boolean
+      skip_sast_cli:
+        description: 'Skip SAST CLI integration tests'
+        required: false
+        default: false
+        type: boolean
+      skip_sca_cli:
+        description: 'Skip SCA CLI integration tests'
+        required: false
+        default: false
+        type: boolean
+      skip_cxgo:
+        description: 'Skip CxGo integration tests'
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      tests_to_run:
+        description: 'Scope of tests to run (all | unit-only | skip)'
+        required: false
+        default: 'all'
+        type: string
+      skip_integration:
+        required: false
+        default: false
+        type: boolean
+      skip_sca_integration:
+        required: false
+        default: false
+        type: boolean
+      skip_jira_integration:
+        required: false
+        default: false
+        type: boolean
+      skip_pr_comments:
+        required: false
+        default: false
+        type: boolean
+      skip_sast_cli:
+        required: false
+        default: false
+        type: boolean
+      skip_sca_cli:
+        required: false
+        default: false
+        type: boolean
+      skip_cxgo:
+        required: false
+        default: false
+        type: boolean
+
+env:
+  JAVA_OPTS: -Xmx3200m
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    if: inputs.tests_to_run != 'skip'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+          restore-keys: gradle-
+
+      - name: Build and test
+        run: ./gradlew clean build
+
+      - name: Assemble fat JAR
+        run: ./gradlew -b build.gradle --build-cache assemble
+
+      - name: Get version from version.txt
+        id: version
+        run: |
+          VERSION=$(cat version.txt | tr -d '[:space:]')
+          cp version.txt build/libs/version.txt
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-libs
+          path: build/libs/
+          retention-days: 1
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-build
+          path: '**/build/test-results/**/*.xml'
+          if-no-files-found: ignore
+          retention-days: 7
+
+#  sonar:
+#    name: SonarCloud Analysis
+#    runs-on: ubuntu-latest
+#    needs: [build]
+#    if: |
+#      inputs.tests_to_run != 'skip' &&
+#      (inputs.tests_to_run == 'all' || inputs.tests_to_run == '') &&
+#      (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop' || github.event_name == 'workflow_call')
+#    steps:
+#      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+#
+#      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+#        with:
+#          java-version: '17'
+#          distribution: 'temurin'
+#
+#      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+#        with:
+#          path: |
+#            ~/.gradle/wrapper
+#            ~/.gradle/caches
+#          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+#          restore-keys: gradle-
+#
+#      - name: Analyze with SonarCloud
+#        env:
+#          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+#        run: ./gradlew clean compileJava compileTestJava sonarqube -x test --info
+#
+#      - name: Check Quality Gate
+#        env:
+#          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+#        run: |
+#          REPORT_PATH="build/sonar/report-task.txt"
+#          SONAR_INSTANCE="https://sonarcloud.io"
+#          ce_task_id=$(grep "ceTaskId=" "$REPORT_PATH" | cut -d'=' -f2)
+#          echo "Using task id: ${ce_task_id}"
+#          if [ -z "$ce_task_id" ]; then
+#            echo "No task id found in report"
+#            exit 1
+#          fi
+#          while true; do
+#            ce_status=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_INSTANCE}/api/ce/task?id=${ce_task_id}" | jq -r .task.status)
+#            echo "SonarCloud task status: ${ce_status}"
+#            case "$ce_status" in
+#              CANCELLED) echo "SonarCloud task was cancelled"; exit 504 ;;
+#              FAILED)    echo "SonarCloud task failed";        exit 500 ;;
+#              SUCCESS)   break ;;
+#            esac
+#            sleep 5
+#          done
+#          ce_analysis_id=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_INSTANCE}/api/ce/task?id=${ce_task_id}" | jq -r .task.analysisId)
+#          qg_status=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_INSTANCE}/api/qualitygates/project_status?analysisId=${ce_analysis_id}" | jq -r .projectStatus.status)
+#          echo "Quality Gate status: ${qg_status}"
+#          if [ "${qg_status}" != "OK" ]; then
+#            echo "Quality Gate failed — blocking merge"
+#            exit 1
+#          fi
+
+  component-tests:
+    name: Component Tests
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: inputs.tests_to_run != 'skip'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+          restore-keys: gradle-
+
+      - name: Run component tests
+        run: ./gradlew clean componentTest --info
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-component
+          path: '**/build/test-results/**/*.xml'
+          if-no-files-found: ignore
+          retention-days: 7
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [build]
+    # Only build Docker on branches that deploy to EKS, or explicit 'all' dispatch
+    if: |
+      inputs.tests_to_run == 'all' ||
+      (inputs.tests_to_run == '' && (
+        github.ref == 'refs/heads/master' ||
+        github.ref == 'refs/heads/develop' ||
+        startsWith(github.ref, 'refs/heads/pr-') ||
+        github.event_name == 'pull_request'
+      ))
+    outputs:
+      sha1_short: ${{ steps.meta.outputs.sha1_short }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.2.1
+        with:
+          name: build-libs
+          path: build/libs/
+
+      - name: Compute SHA
+        id: meta
+        run: |
+          SHA1_SHORT="${GITHUB_SHA::7}"
+          echo "sha1_short=${SHA1_SHORT}" >> $GITHUB_OUTPUT
+
+      - name: Docker login (PAT)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Build and push java17 image (SHA tag — for EKS testing)
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        with:
+          context: .
+          target: java17
+          push: true
+          tags: ${{ secrets.DOCKER_REPO }}:${{ steps.meta.outputs.sha1_short }}
+
+      - name: Build and push java17-debian image (SHA tag — for EKS testing)
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        with:
+          context: .
+          target: java17-debian
+          push: true
+          tags: ${{ secrets.DOCKER_REPO_DEBIAN }}:${{ steps.meta.outputs.sha1_short }}
+
+  deploy-eks:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: [docker-build, component-tests]
+    outputs:
+      namespace: ${{ steps.vars.outputs.namespace }}
+      release_name: ${{ steps.vars.outputs.release_name }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set deployment variables
+        id: vars
+        run: |
+          SHA="${{ needs.docker-build.outputs.sha1_short }}"
+          echo "namespace=cxflow-${SHA}" >> $GITHUB_OUTPUT
+          echo "release_name=cxflow-${SHA}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
+        with:
+          role-to-assume: arn:aws:iam::983555762431:role/cx-flow-ci-circleci
+          aws-region: eu-west-1
+
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+        with:
+          version: 'v1.23.0'
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name eks-cxflow-ci --region eu-west-1
+
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: 'v3.9.0'
+
+      - name: Patch chart appVersion
+        run: |
+          sed -i "s/appVersion:[[:space:]]*.*/appVersion: '${{ needs.docker-build.outputs.sha1_short }}'/g" ./helm/cxflow/Chart.yaml
+
+      - name: Deploy cx-flow to EKS
+        # CXFLOW_GITHUB_TOKEN: GitHub PAT for cx-flow webhook integration.
+        # Kept separate from the built-in GITHUB_TOKEN (which is reserved by GitHub Actions).
+        run: |
+          helm upgrade --install --create-namespace \
+            --namespace ${{ steps.vars.outputs.namespace }} \
+            ${{ steps.vars.outputs.release_name }} \
+            --set cxflow.githubToken=${{ secrets.CXFLOW_GITHUB_TOKEN }} \
+            --set cxflow.githubWebhookToken=${{ secrets.GITHUB_WEBHOOK_TOKEN }} \
+            --set cxflow.jiraUrl=${{ secrets.JIRA_URL }} \
+            --set cxflow.jiraUserName=${{ secrets.JIRA_USERNAME }} \
+            --set cxflow.jiraToken=${{ secrets.JIRA_TOKEN }} \
+            --set cxflow.jiraProject=${{ secrets.JIRA_PROJECT }} \
+            --set cxflow.azureToken=${{ secrets.AZURE_TOKEN }} \
+            --set cxflow.gitlabToken=${{ secrets.GITLAB_TOKEN }} \
+            --set cxflow.gitlabConfigAsCode=${{ secrets.GITLAB_CONFIG_AS_CODE }} \
+            --set cxflow.gitlabWebhookToken=${{ secrets.GITLAB_WEBHOOK_TOKEN }} \
+            --set ingress.hosts[0].host=${{ steps.vars.outputs.release_name }}.${{ secrets.EXTERNAL_DNS_DOMAIN }} \
+            --set "ingress.hosts[0].paths[0]=/*" \
+            ./helm/cxflow
+
+      - name: Wait and verify deployment
+        if: always()
+        run: |
+          sleep 60
+          kubectl get all -n ${{ steps.vars.outputs.namespace }}
+
+      - name: Rollback on deploy failure
+        if: failure()
+        run: |
+          helm uninstall ${{ steps.vars.outputs.release_name }} \
+            --namespace ${{ steps.vars.outputs.namespace }} || true
+          kubectl delete namespace ${{ steps.vars.outputs.namespace }} || true
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Integration tests — all run in parallel after EKS deployment.
+  # Each can be individually skipped via workflow_dispatch boolean inputs.
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-eks]
+    if: needs.deploy-eks.result == 'success' && !inputs.skip_integration
+    env:
+      HOOK_TARGET: https://${{ needs.deploy-eks.outputs.release_name }}.${{ secrets.EXTERNAL_DNS_DOMAIN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+          restore-keys: gradle-
+
+      - name: Run integration tests
+        run: |
+          ./gradlew clean integrationTest --info \
+            -Dtarget=${{ env.HOOK_TARGET }} \
+            -Drepo=${{ secrets.HOOK_REPO }} \
+            -Dnamespace=${{ secrets.HOOK_NAMESPACE }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-integration
+          path: '**/build/test-results/**/*.xml'
+          if-no-files-found: ignore
+          retention-days: 7
+
+  sca-integration-tests:
+    name: SCA Integration Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-eks]
+    if: needs.deploy-eks.result == 'success' && !inputs.skip_sca_integration
+    env:
+      HOOK_TARGET: https://${{ needs.deploy-eks.outputs.release_name }}.${{ secrets.EXTERNAL_DNS_DOMAIN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+          restore-keys: gradle-
+
+      - name: Run SCA integration tests
+        run: |
+          ./gradlew clean ScaIntegrationTest --info \
+            -Dtarget=${{ env.HOOK_TARGET }} \
+            -Drepo=${{ secrets.HOOK_REPO }} \
+            -Dnamespace=${{ secrets.HOOK_NAMESPACE }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-sca-integration
+          path: '**/build/test-results/**/*.xml'
+          if-no-files-found: ignore
+          retention-days: 7
+
+  jira-integration-tests:
+    name: Jira Integration Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-eks]
+    if: needs.deploy-eks.result == 'success' && !inputs.skip_jira_integration
+    env:
+      HOOK_TARGET: https://${{ needs.deploy-eks.outputs.release_name }}.${{ secrets.EXTERNAL_DNS_DOMAIN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+          restore-keys: gradle-
+
+      - name: Run Jira integration tests
+        run: |
+          ./gradlew clean JiraIntegrationTest --info \
+            -Dtarget=${{ env.HOOK_TARGET }} \
+            -Drepo=${{ secrets.HOOK_REPO }} \
+            -Dnamespace=${{ secrets.HOOK_NAMESPACE }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-jira-integration
+          path: '**/build/test-results/**/*.xml'
+          if-no-files-found: ignore
+          retention-days: 7
+
+  pr-comments-integration-tests:
+    name: PR Comments Integration Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-eks]
+    if: needs.deploy-eks.result == 'success' && !inputs.skip_pr_comments
+    env:
+      HOOK_TARGET: https://${{ needs.deploy-eks.outputs.release_name }}.${{ secrets.EXTERNAL_DNS_DOMAIN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+          restore-keys: gradle-
+
+      - name: Run PR comments integration tests
+        run: |
+          ./gradlew clean PullRequestCommnetsIntegrationTest --info \
+            -Dtarget=${{ env.HOOK_TARGET }} \
+            -Drepo=${{ secrets.HOOK_REPO }} \
+            -Dnamespace=${{ secrets.HOOK_NAMESPACE }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-pr-comments-integration
+          path: '**/build/test-results/**/*.xml'
+          if-no-files-found: ignore
+          retention-days: 7
+
+  sast-cli-integration-tests:
+    name: SAST CLI Integration Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-eks]
+    if: needs.deploy-eks.result == 'success' && !inputs.skip_sast_cli
+    env:
+      HOOK_TARGET: https://${{ needs.deploy-eks.outputs.release_name }}.${{ secrets.EXTERNAL_DNS_DOMAIN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+          restore-keys: gradle-
+
+      - name: Import SSL certificate
+        run: |
+          sudo keytool -import -alias sastcer -storepass changeit \
+            -keystore "$JAVA_HOME/lib/security/cacerts" \
+            -file src/test/resources/checkmarx.crt --noprompt
+
+      - name: Run SAST CLI integration tests
+        run: |
+          ./gradlew clean SastCliIntegrationTest --info \
+            -Dtarget=${{ env.HOOK_TARGET }} \
+            -Drepo=${{ secrets.HOOK_REPO }} \
+            -Dnamespace=${{ secrets.HOOK_NAMESPACE }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-sast-cli-integration
+          path: '**/build/test-results/**/*.xml'
+          if-no-files-found: ignore
+          retention-days: 7
+
+  sca-cli-integration-tests:
+    name: SCA CLI Integration Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-eks]
+    if: needs.deploy-eks.result == 'success' && !inputs.skip_sca_cli
+    env:
+      HOOK_TARGET: https://${{ needs.deploy-eks.outputs.release_name }}.${{ secrets.EXTERNAL_DNS_DOMAIN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+          restore-keys: gradle-
+
+      - name: Run SCA CLI integration tests
+        run: |
+          ./gradlew clean ScaCliIntegrationTest --info \
+            -Dtarget=${{ env.HOOK_TARGET }} \
+            -Drepo=${{ secrets.HOOK_REPO }} \
+            -Dnamespace=${{ secrets.HOOK_NAMESPACE }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-sca-cli-integration
+          path: '**/build/test-results/**/*.xml'
+          if-no-files-found: ignore
+          retention-days: 7
+
+  cxgo-integration-tests:
+    name: CxGo Integration Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-eks]
+    if: needs.deploy-eks.result == 'success' && !inputs.skip_cxgo
+    env:
+      HOOK_TARGET: https://${{ needs.deploy-eks.outputs.release_name }}.${{ secrets.EXTERNAL_DNS_DOMAIN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+          restore-keys: gradle-
+
+      - name: Run CxGo integration tests
+        run: |
+          ./gradlew clean CxGoIntegrationTest --info \
+            -Dtarget=${{ env.HOOK_TARGET }} \
+            -Drepo=${{ secrets.HOOK_REPO }} \
+            -Dnamespace=${{ secrets.HOOK_NAMESPACE }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-cxgo-integration
+          path: '**/build/test-results/**/*.xml'
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # codebashing-integration-tests:
+  #   name: CodeBashing Integration Tests
+  #   runs-on: ubuntu-latest
+  #   needs: [deploy-eks]
+  #   if: needs.deploy-eks.result == 'success' && !inputs.skip_codebashing
+  #   env:
+  #     HOOK_TARGET: https://${{ needs.deploy-eks.outputs.release_name }}.${{ secrets.EXTERNAL_DNS_DOMAIN }}
+  #   steps:
+  #     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+  #     - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+  #       with:
+  #         java-version: '17'
+  #         distribution: 'temurin'
+  #     - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+  #       with:
+  #         path: |
+  #           ~/.gradle/wrapper
+  #           ~/.gradle/caches
+  #         key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+  #         restore-keys: gradle-
+  #     - name: Import SSL certificate
+  #       run: |
+  #         sudo keytool -import -alias sastcer -storepass changeit \
+  #           -keystore "$JAVA_HOME/lib/security/cacerts" \
+  #           -file src/test/resources/checkmarx.crt --noprompt
+  #     - name: Run CodeBashing integration tests
+  #       run: |
+  #         ./gradlew clean CodeBashingIntegrationTest --info \
+  #           -Dtarget=${{ env.HOOK_TARGET }} \
+  #           -Drepo=${{ secrets.HOOK_REPO }} \
+  #           -Dnamespace=${{ secrets.HOOK_NAMESPACE }}
+  #     - name: Upload test results
+  #       if: always()
+  #       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+  #       with:
+  #         name: test-results-codebashing-integration
+  #         path: '**/build/test-results/**/*.xml'
+  #         if-no-files-found: ignore
+  #         retention-days: 7
+
+  cleanup-eks:
+    name: Cleanup EKS
+    runs-on: ubuntu-latest
+    needs:
+      - deploy-eks
+      - integration-tests
+      - sca-integration-tests
+      - jira-integration-tests
+      - pr-comments-integration-tests
+      - sast-cli-integration-tests
+      - sca-cli-integration-tests
+      - cxgo-integration-tests
+    # Always clean up if EKS was deployed, regardless of test outcomes or skips
+    if: always() && needs.deploy-eks.result == 'success'
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
+        with:
+          role-to-assume: arn:aws:iam::983555762431:role/cx-flow-ci-circleci
+          aws-region: eu-west-1
+
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+        with:
+          version: 'v1.23.6'
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name eks-cxflow-ci --region eu-west-1
+
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: 'v3.3.4'
+
+      - name: Uninstall Helm release
+        run: |
+          helm uninstall ${{ needs.deploy-eks.outputs.release_name }} \
+            --namespace ${{ needs.deploy-eks.outputs.namespace }} || true
+
+      - name: Delete namespace
+        run: |
+          kubectl delete namespace ${{ needs.deploy-eks.outputs.namespace }} || true

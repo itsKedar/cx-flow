@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  # Automatically trigger a release after CI Tests pass on master or develop
+  workflow_run:
+    workflows: ["CI Tests"]
+    types: [completed]
+    branches:
+      - master
+      - develop
+
+  # Manually trigger a release — optionally skipping tests
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip CI tests and release immediately'
+        required: false
+        default: false
+        type: boolean
+      target_branch:
+        description: 'Branch to release from (master = stable, develop = pre-release)'
+        required: false
+        default: 'develop'
+        type: choice
+        options:
+          - develop
+          - master
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Optional: run the full CI test suite before releasing (workflow_dispatch only).
+  # When triggered via workflow_run, tests have already passed — this is skipped.
+  # ──────────────────────────────────────────────────────────────────────────────
+  run-tests:
+    name: Run CI Tests
+    if: github.event_name == 'workflow_dispatch' && !inputs.skip_tests
+    uses: ./.github/workflows/ci-tests.yml
+    with:
+      tests_to_run: 'all'
+    secrets: inherit
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Build JAR + push all Docker tags + create GitHub release
+  # ──────────────────────────────────────────────────────────────────────────────
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    needs: [run-tests]
+    # Run when:
+    #   • workflow_run  : CI Tests completed successfully (automatic)
+    #   • workflow_dispatch skip_tests=true  : bypass requested
+    #   • workflow_dispatch skip_tests=false : run-tests job succeeded
+    if: |
+      always() && (
+        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.skip_tests) ||
+        (github.event_name == 'workflow_dispatch' && !inputs.skip_tests && needs.run-tests.result == 'success')
+      )
+    steps:
+      - name: Resolve checkout ref
+        id: ref
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            echo "sha=${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
+            echo "branch=${{ github.event.workflow_run.head_branch }}" >> $GITHUB_OUTPUT
+          else
+            echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "branch=${{ inputs.target_branch }}" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.ref.outputs.sha }}
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle') }}
+          restore-keys: gradle-
+
+      - name: Build fat JAR
+        env:
+          JAVA_OPTS: -Xmx3200m
+        run: |
+          ./gradlew clean build
+          ./gradlew -b build.gradle --build-cache assemble
+
+      - name: Get version from version.txt
+        id: version
+        run: |
+          VERSION=$(cat version.txt | tr -d '[:space:]')
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Determine release type
+        id: release-type
+        run: |
+          if [[ "${{ steps.ref.outputs.branch }}" == "master" ]]; then
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Docker login (PAT)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Build and push java17 image (all stable tags)
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        with:
+          context: .
+          target: java17
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_REPO }}:${{ steps.version.outputs.version }}-17
+            ${{ secrets.DOCKER_REPO }}:${{ steps.version.outputs.version }}
+            ${{ secrets.DOCKER_REPO }}:latest
+
+      - name: Build and push java17-debian image (all stable tags)
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        with:
+          context: .
+          target: java17-debian
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_REPO_DEBIAN }}:${{ steps.version.outputs.version }}-17
+            ${{ secrets.DOCKER_REPO_DEBIAN }}:${{ steps.version.outputs.version }}
+            ${{ secrets.DOCKER_REPO_DEBIAN }}:latest
+
+      - name: Remove version.txt from release assets
+        run: rm -f build/libs/version.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          target_commitish: ${{ steps.ref.outputs.sha }}
+          prerelease: ${{ steps.release-type.outputs.is_prerelease }}
+          files: build/libs/*.jar
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail_on_unmatched_files: true

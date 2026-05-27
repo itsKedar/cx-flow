@@ -1,0 +1,51 @@
+name: Nightly EKS Cleanup
+
+on:
+  schedule:
+    # 1:00 AM UTC daily — matches the original CircleCI nightly-cleanup schedule
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+jobs:
+  clean-eks:
+    name: Delete stale EKS namespaces
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::983555762431:role/cx-flow-ci-circleci
+          aws-region: eu-west-1
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.23.6'
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name eks-cxflow-ci --region eu-west-1
+
+      - name: Delete stale namespaces
+        run: |
+          kubectl get ns
+          PROTECTED="default kube-node-lease kube-public kube-system nginx-kibana-ci"
+          ALL_NS=$(kubectl get ns -o jsonpath="{.items[*].metadata.name}")
+          TO_DELETE=""
+          for ns in $ALL_NS; do
+            is_protected=false
+            for p in $PROTECTED; do
+              if [[ "$ns" == "$p" ]]; then
+                is_protected=true
+                break
+              fi
+            done
+            if [[ "$is_protected" == "false" ]]; then
+              TO_DELETE="$TO_DELETE $ns"
+            fi
+          done
+          TO_DELETE="${TO_DELETE# }"
+          if [[ -z "$TO_DELETE" ]]; then
+            echo "No stale namespaces to delete."
+          else
+            echo "Deleting namespaces: $TO_DELETE"
+            kubectl delete namespace $TO_DELETE
+          fi
