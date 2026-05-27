@@ -46,6 +46,8 @@ jobs:
     name: Build and Release
     runs-on: ubuntu-latest
     needs: [run-tests]
+    permissions:
+      contents: write
     # Run when:
     #   • workflow_run  : CI Tests completed successfully (automatic)
     #   • workflow_dispatch skip_tests=true  : bypass requested
