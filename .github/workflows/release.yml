@@ -109,38 +109,55 @@ jobs:
             echo "is_prerelease=true" >> $GITHUB_OUTPUT
           fi
 
+      - name: Generate Docker tags
+        id: docker-tags
+        run: |
+          SHA="${{ steps.ref.outputs.sha }}"
+          SHORT_SHA="${SHA:0:7}"
+          VERSION="${{ steps.version.outputs.version }}"
+          REPO="${{ secrets.DOCKER_REPO }}"
+          REPO_DEBIAN="${{ secrets.DOCKER_REPO_DEBIAN }}"
+
+          if [[ "${{ steps.release-type.outputs.is_prerelease }}" == "true" ]]; then
+            # develop: SHA tag only — no version or latest
+            echo "tags_java17=${REPO}:${SHORT_SHA}" >> $GITHUB_OUTPUT
+            echo "tags_debian=${REPO_DEBIAN}:${SHORT_SHA}" >> $GITHUB_OUTPUT
+          else
+            # master: full stable tag set
+            echo "tags_java17=${REPO}:${VERSION}-17,${REPO}:${VERSION},${REPO}:latest" >> $GITHUB_OUTPUT
+            echo "tags_debian=${REPO_DEBIAN}:${VERSION}-17,${REPO_DEBIAN}:${VERSION},${REPO_DEBIAN}:latest" >> $GITHUB_OUTPUT
+          fi
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+
       - name: Docker login (PAT)
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           username: ${{ secrets.DOCKER_USER }}
           password: ${{ secrets.DOCKER_PAT }}
 
-      - name: Build and push java17 image (all stable tags)
+      - name: Build and push java17 image
+        id: docker-java17
         uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
         with:
           context: .
           target: java17
           push: true
-          tags: |
-            ${{ secrets.DOCKER_REPO }}:${{ steps.version.outputs.version }}-17
-            ${{ secrets.DOCKER_REPO }}:${{ steps.version.outputs.version }}
-            ${{ secrets.DOCKER_REPO }}:latest
+          tags: ${{ steps.docker-tags.outputs.tags_java17 }}
 
-      - name: Build and push java17-debian image (all stable tags)
+      - name: Build and push java17-debian image
+        id: docker-debian
         uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
         with:
           context: .
           target: java17-debian
           push: true
-          tags: |
-            ${{ secrets.DOCKER_REPO_DEBIAN }}:${{ steps.version.outputs.version }}-17
-            ${{ secrets.DOCKER_REPO_DEBIAN }}:${{ steps.version.outputs.version }}
-            ${{ secrets.DOCKER_REPO_DEBIAN }}:latest
+          tags: ${{ steps.docker-tags.outputs.tags_debian }}
 
       - name: Remove version.txt from release assets
         run: rm -f build/libs/version.txt
 
       - name: Create GitHub release
+        id: github-release
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
           tag_name: ${{ steps.version.outputs.version }}
@@ -150,3 +167,35 @@ jobs:
           files: build/libs/*.jar
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_on_unmatched_files: true
+
+      - name: Rollback pushed Docker images on failure
+        if: failure()
+        env:
+          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+          DOCKER_PAT: ${{ secrets.DOCKER_PAT }}
+        run: |
+          HUB_TOKEN=$(curl -s -X POST https://hub.docker.com/v2/users/login/ \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${DOCKER_USER}\",\"password\":\"${DOCKER_PAT}\"}" \
+            | jq -r .token)
+
+          delete_tag() {
+            local FULL_REF=$1
+            local REPO="${FULL_REF%:*}"
+            local TAG="${FULL_REF##*:}"
+            STATUS=$(curl -s -X DELETE \
+              -H "Authorization: JWT ${HUB_TOKEN}" \
+              -o /dev/null -w "%{http_code}" \
+              "https://hub.docker.com/v2/repositories/${REPO}/tags/${TAG}/")
+            echo "Deleted ${FULL_REF} → HTTP ${STATUS}"
+          }
+
+          if [[ "${{ steps.docker-java17.outcome }}" == "success" ]]; then
+            IFS=',' read -ra TAGS <<< "${{ steps.docker-tags.outputs.tags_java17 }}"
+            for T in "${TAGS[@]}"; do delete_tag "$T"; done
+          fi
+
+          if [[ "${{ steps.docker-debian.outcome }}" == "success" ]]; then
+            IFS=',' read -ra TAGS <<< "${{ steps.docker-tags.outputs.tags_debian }}"
+            for T in "${TAGS[@]}"; do delete_tag "$T"; done
+          fi
